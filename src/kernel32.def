@@ -1,0 +1,22 @@
+LIBRARY kernel32.dll
+EXPORTS
+CloseHandle@4
+CreateFileW@28
+CreateThread@24
+DisableThreadLibraryCalls@4
+FlushInstructionCache@12
+GetCurrentProcess@0
+GetModuleFileNameW@12
+GetModuleHandleA@4
+GetModuleHandleW@4
+GetPrivateProfileIntW@16
+GetProcAddress@8
+InterlockedExchange@8
+InterlockedIncrement@4
+LoadLibraryA@4
+Sleep@4
+VirtualProtect@16
+WriteFile@20
+lstrcatW@8
+lstrcpyW@8
+VirtualAlloc@16
