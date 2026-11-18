@@ -100,7 +100,6 @@ src/
   user32.def
   kotor.ico            icon
   build.sh             build script
-nexus/                 promo images
 ```
 
 ## Troubleshooting
