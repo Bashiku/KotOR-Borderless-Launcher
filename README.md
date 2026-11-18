@@ -1,12 +1,8 @@
-![KotOR Borderless Launcher](nexus/nexus_header_1920x480.png)
-
 # KotOR Borderless Launcher
 
 A portable launcher for **Star Wars: Knights of the Old Republic** (2003) that runs the game in a true borderless fullscreen window at any resolution, with the widescreen fixes the game needs on modern monitors.
 
 KotOR only supports exclusive fullscreen (display-mode switch, slow alt-tab) or a small framed window. External tools that force a window borderless tend to fight with the game. This launcher fixes the problem from the inside: it starts the game suspended, loads a small DLL before any game code runs, and hooks the window and display-mode calls the game makes. swkotor.exe is never modified on disk.
-
-![Launcher](nexus/nexus_main_1920x1080.png)
 
 ## Features
 
