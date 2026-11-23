@@ -20,3 +20,6 @@ WriteFile@20
 lstrcatW@8
 lstrcpyW@8
 VirtualAlloc@16
+GetSystemDirectoryW@8
+LoadLibraryW@4
+lstrcmpiW@8

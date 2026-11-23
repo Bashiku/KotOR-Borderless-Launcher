@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
@@ -15,39 +16,23 @@ namespace KotorLauncher
     static class Native
     {
         [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+        [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr ctx);
+        [DllImport("shcore.dll")] static extern int SetProcessDpiAwareness(int value);
+
+        // Per-monitor DPI awareness, so screen sizes are always real pixels (system-aware apps get
+        // scaled values when the logon scale differs from the monitor's current scale).
+        public static void MakeDpiAware()
+        {
+            try { if (SetProcessDpiAwarenessContext((IntPtr)(-4)) || SetProcessDpiAwarenessContext((IntPtr)(-3))) return; } catch { }
+            try { if (SetProcessDpiAwareness(2) == 0) return; } catch { }
+            try { SetProcessDPIAware(); } catch { }
+        }
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
         public static extern int GetPrivateProfileStringW(string sec, string key, string def, StringBuilder ret, int size, string file);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern bool WritePrivateProfileStringW(string sec, string key, string val, string file);
 
-        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-        public struct STARTUPINFO
-        {
-            public int cb; public string lpReserved, lpDesktop, lpTitle;
-            public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
-            public short wShowWindow, cbReserved2; public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
-        }
-        [StructLayout(LayoutKind.Sequential)]
-        public struct PROCESS_INFORMATION { public IntPtr hProcess, hThread; public int dwProcessId, dwThreadId; }
-
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        public static extern bool CreateProcessW(string app, StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit,
-            uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
-        [DllImport("kernel32.dll", SetLastError = true)]
-        public static extern IntPtr VirtualAllocEx(IntPtr p, IntPtr addr, IntPtr size, uint type, uint prot);
-        [DllImport("kernel32.dll", SetLastError = true)]
-        public static extern bool VirtualFreeEx(IntPtr p, IntPtr addr, IntPtr size, uint type);
-        [DllImport("kernel32.dll", SetLastError = true)]
-        public static extern bool WriteProcessMemory(IntPtr p, IntPtr addr, byte[] buf, IntPtr size, out IntPtr written);
-        [DllImport("kernel32.dll", SetLastError = true)]
-        public static extern IntPtr CreateRemoteThread(IntPtr p, IntPtr attr, IntPtr stack, IntPtr start, IntPtr param, uint flags, out int tid);
-        [DllImport("kernel32.dll")] public static extern uint WaitForSingleObject(IntPtr h, uint ms);
-        [DllImport("kernel32.dll")] public static extern bool GetExitCodeThread(IntPtr h, out uint code);
-        [DllImport("kernel32.dll")] public static extern uint ResumeThread(IntPtr h);
-        [DllImport("kernel32.dll")] public static extern bool TerminateProcess(IntPtr h, uint code);
-        [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr GetModuleHandleW(string name);
         [DllImport("kernel32.dll", CharSet = CharSet.Ansi)] public static extern IntPtr GetProcAddress(IntPtr mod, string name);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern IntPtr LoadLibraryW(string path);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern bool SetDllDirectoryW(string path);
@@ -140,9 +125,10 @@ namespace KotorLauncher
             return s;
         }
 
-        public void Save()
+        public void Save() { SaveTo(IniPath); }
+
+        public void SaveTo(string f)
         {
-            string f = IniPath;
             Func<bool, string> b = x => x ? "1" : "0";
             Ini.Set(f, "Launcher", "GamePath", GamePath);
             Ini.Set(f, "Launcher", "CloseAfterLaunch", b(CloseAfterLaunch));
@@ -261,44 +247,36 @@ namespace KotorLauncher
             Ini.Set(f, "Graphics Options", "AllowWindowedMode", "1");
         }
 
-        // Start swkotor.exe suspended, load kotorfix.dll into it, then let it run.
-        public static int LaunchWithFix(string gameDir, string dll)
+        public const string ProxyName = "dinput8.dll";
+
+        static bool IsOurProxy(string path)
         {
-            string exe = Path.Combine(gameDir, "swkotor.exe");
-            var si = new Native.STARTUPINFO(); si.cb = Marshal.SizeOf(si);
-            Native.PROCESS_INFORMATION pi;
-            const uint CREATE_SUSPENDED = 4;
-            if (!Native.CreateProcessW(exe, new StringBuilder("\"" + exe + "\""), IntPtr.Zero, IntPtr.Zero, false,
-                    CREATE_SUSPENDED, IntPtr.Zero, gameDir, ref si, out pi))
-                throw new Exception(L.T("swkotor.exe başlatılamadı (hata ", "Could not start swkotor.exe (error ") + Marshal.GetLastWin32Error() + ")");
-            bool ok = false;
-            try
+            try { return Encoding.ASCII.GetString(File.ReadAllBytes(path)).Contains("kotorfix loaded"); } catch { return false; }
+        }
+
+        // The fix ships as a dinput8.dll proxy: swkotor.exe loads it itself at startup (it imports
+        // DirectInput8Create), so nothing is injected. Copy it next to swkotor.exe if needed.
+        public static void InstallProxy(string gameDir, Action<string> log)
+        {
+            string src = Path.Combine(Program.BaseDir, ProxyName);
+            string dst = Path.Combine(gameDir, ProxyName);
+            if (string.Equals(Path.GetFullPath(src), Path.GetFullPath(dst), StringComparison.OrdinalIgnoreCase)) return;
+            if (!File.Exists(src)) throw new Exception(L.T("dinput8.dll launcher'ın yanında bulunamadı: ", "dinput8.dll not found next to the launcher: ") + src);
+            if (File.Exists(dst))
             {
-                byte[] path = Encoding.Unicode.GetBytes(dll + "\0");
-                IntPtr mem = Native.VirtualAllocEx(pi.hProcess, IntPtr.Zero, (IntPtr)path.Length, 0x3000, 0x04);
-                if (mem == IntPtr.Zero) throw new Exception(L.T("VirtualAllocEx hata ", "VirtualAllocEx error ") + Marshal.GetLastWin32Error());
-                IntPtr wr;
-                if (!Native.WriteProcessMemory(pi.hProcess, mem, path, (IntPtr)path.Length, out wr))
-                    throw new Exception(L.T("WriteProcessMemory hata ", "WriteProcessMemory error ") + Marshal.GetLastWin32Error());
-                IntPtr ll = Native.GetProcAddress(Native.GetModuleHandleW("kernel32.dll"), "LoadLibraryW");
-                int tid;
-                IntPtr th = Native.CreateRemoteThread(pi.hProcess, IntPtr.Zero, IntPtr.Zero, ll, mem, 0, out tid);
-                if (th == IntPtr.Zero) throw new Exception(L.T("CreateRemoteThread hata ", "CreateRemoteThread error ") + Marshal.GetLastWin32Error());
-                uint wait = Native.WaitForSingleObject(th, 15000);
-                uint code; Native.GetExitCodeThread(th, out code);
-                Native.CloseHandle(th);
-                if (wait != 0) throw new Exception(L.T("DLL yükleme zaman aşımı", "DLL load timed out"));
-                Native.VirtualFreeEx(pi.hProcess, mem, IntPtr.Zero, 0x8000);
-                if (code == 0) throw new Exception(L.T("kotorfix.dll oyuna yüklenemedi (LoadLibrary başarısız)", "kotorfix.dll could not be loaded into the game (LoadLibrary failed)"));
-                Native.ResumeThread(pi.hThread);
-                ok = true;
-                return pi.dwProcessId;
+                if (!IsOurProxy(dst))
+                    throw new Exception(L.T("Oyun klasöründe başka bir mod'a ait dinput8.dll var; üzerine yazılmadı: ",
+                                            "The game folder already has a dinput8.dll from another mod; not overwriting: ") + dst);
+                if (new FileInfo(dst).Length == new FileInfo(src).Length && File.ReadAllBytes(dst).SequenceEqual(File.ReadAllBytes(src))) return;
             }
-            finally
-            {
-                if (!ok) Native.TerminateProcess(pi.hProcess, 1);
-                Native.CloseHandle(pi.hThread); Native.CloseHandle(pi.hProcess);
-            }
+            File.Copy(src, dst, true);
+            log(L.T("dinput8.dll oyun klasörüne kuruldu.", "Installed dinput8.dll into the game folder."));
+        }
+
+        public static void UninstallProxy(string gameDir)
+        {
+            string dst = Path.Combine(gameDir, ProxyName);
+            if (File.Exists(dst) && IsOurProxy(dst)) File.Delete(dst);
         }
 
         public static void LaunchPlain(string gameDir)
@@ -310,8 +288,7 @@ namespace KotorLauncher
         public static bool IsRunning(string name) { return Process.GetProcessesByName(name).Length > 0; }
 
         // Full launch pipeline; log receives progress lines. Returns true on success.
-        // Steam build: swkotor.exe is wrapped by SteamStub DRM (".bind" section). Started outside Steam it fails
-        // with "Application load error 5:0000065434" unless steam_appid.txt is present and Steam is running.
+        // Steam build: swkotor.exe is wrapped by SteamStub DRM (".bind" section) and must be started by Steam.
         public static bool IsSteamExe(string gameDir)
         {
             try
@@ -324,24 +301,6 @@ namespace KotorLauncher
             }
             catch { }
             return File.Exists(Path.Combine(gameDir, "steam_api.dll"));
-        }
-
-        static void PrepareSteam(string gameDir, Action<string> log)
-        {
-            string appid = Path.Combine(gameDir, "steam_appid.txt");
-            if (!File.Exists(appid) || File.ReadAllText(appid).Trim() != "32370")
-            {
-                File.WriteAllText(appid, "32370");
-                log(L.T("Steam sürümü: steam_appid.txt (32370) oluşturuldu.", "Steam build: created steam_appid.txt (32370)."));
-            }
-            if (IsRunning("steam")) return;
-            log(L.T("Steam açılıyor…", "Starting Steam…"));
-            try { Process.Start("steam://open/main"); } catch { }
-            for (int i = 0; i < 60 && !IsRunning("steam"); i++) System.Threading.Thread.Sleep(500);
-            if (!IsRunning("steam"))
-                throw new Exception(L.T("Steam sürümü için Steam'in açık olması gerekiyor. Steam'i açıp tekrar deneyin.",
-                                        "The Steam version needs Steam running. Start Steam and try again."));
-            System.Threading.Thread.Sleep(4000);   // let Steam finish logging in
         }
 
         public static bool Launch(Settings s, Action<string> log)
@@ -371,11 +330,23 @@ namespace KotorLauncher
                 else log(L.T("HUD dosyaları zaten ", "HUD files already prepared for ") + key + L.T(" için hazır.", "."));
             }
 
-            if (IsSteamExe(game)) PrepareSteam(game, log);
-            string dll = Path.Combine(Program.BaseDir, "kotorfix.dll");
-            if (!File.Exists(dll)) throw new Exception(L.T("kotorfix.dll bulunamadı: ", "kotorfix.dll not found: ") + dll);
-            int pid = LaunchWithFix(game, dll);
-            log(L.T("Oyun başlatıldı (PID ", "Game started (PID ") + pid + L.T("), kotorfix.dll yüklendi. Ayrıntılar: kotorfix.log", "), kotorfix.dll loaded. Details: kotorfix.log"));
+            // settings for the proxy live next to it, in the game folder
+            string gameIni = Path.Combine(game, "kotorfix.ini");
+            if (!string.Equals(Path.GetFullPath(gameIni), Path.GetFullPath(Settings.IniPath), StringComparison.OrdinalIgnoreCase))
+                s.SaveTo(gameIni);
+            InstallProxy(game, log);
+
+            if (IsSteamExe(game))
+            {
+                // Steam build (SteamStub DRM): let Steam start it; the proxy is loaded either way
+                Process.Start("steam://rungameid/32370");
+                log(L.T("Oyun Steam üzerinden başlatılıyor. Ayrıntılar: kotorfix.log (oyun klasörü)", "Starting the game through Steam. Details: kotorfix.log (game folder)"));
+            }
+            else
+            {
+                LaunchPlain(game);
+                log(L.T("Oyun başlatıldı. Ayrıntılar: kotorfix.log (oyun klasörü)", "Game started. Details: kotorfix.log (game folder)"));
+            }
             return true;
         }
     }

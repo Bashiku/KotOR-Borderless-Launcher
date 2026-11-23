@@ -70,6 +70,9 @@ static void logf(const char *fmt, ...)
     WriteFile(g_log, buf, n, &w, NULL);
 }
 
+static void *proc(const char *dll, const char *fn);
+static void ensure_dpi_aware(void);
+
 static void build_path(WCHAR *out, const WCHAR *name)
 {
     lstrcpyW(out, g_dir);
@@ -98,6 +101,7 @@ static void load_config(void)
     cfg.subtitleFix  = RD(L"SubtitleFix", 1);
     cfg.clipCursor   = RD(L"ClipCursor", 0);
     cfg.dpiAware     = RD(L"DpiAware", 1);
+    ensure_dpi_aware();
     cfg.blockGamma   = RD(L"BlockGamma", 0);
     cfg.monitor      = RD(L"Monitor", 0);
     cfg.skipIntro    = RD(L"SkipIntro", 0);
@@ -232,12 +236,29 @@ static pChangeDisplaySettingsA oChangeDisplaySettingsA;
 static pSetDeviceGammaRamp     oSetDeviceGammaRamp;
 
 static LONG g_dpiDone;
+/* Per-monitor DPI awareness. "System aware" (SetProcessDPIAware) is NOT enough: when the
+   scale Windows had at logon differs from the monitor's current scale (common after a reboot,
+   monitor change or scale change without signing out), DWM bitmap-scales system-aware windows,
+   so a 1920x1080 borderless window shows up as e.g. 1536x864 and blurry. Per-monitor aware
+   windows are never scaled. Fallback chain: PMv2 -> PMv1 (shcore) -> system aware. */
 static void ensure_dpi_aware(void)
 {
-    if (cfg.dpiAware && InterlockedExchange(&g_dpiDone, 1) == 0) {
-        BOOL ok = SetProcessDPIAware();
-        logf("SetProcessDPIAware -> %d", ok);
+    typedef BOOL (WINAPI *pSetCtx)(HANDLE);
+    typedef LONG (WINAPI *pSetAw)(int);
+    pSetCtx setCtx;
+    if (!cfg.dpiAware || InterlockedExchange(&g_dpiDone, 1) != 0) return;
+    setCtx = (pSetCtx)proc("user32.dll", "SetProcessDpiAwarenessContext");
+    if (setCtx && setCtx((HANDLE)(LONG_PTR)-4)) { logf("DPI: per-monitor v2"); return; }      /* PER_MONITOR_AWARE_V2 */
+    if (setCtx && setCtx((HANDLE)(LONG_PTR)-3)) { logf("DPI: per-monitor v1"); return; }      /* PER_MONITOR_AWARE */
+    {
+        pSetAw setAw = (pSetAw)proc("shcore.dll", "SetProcessDpiAwareness");
+        if (setAw) {
+            LONG hr = setAw(2);                                                                 /* PROCESS_PER_MONITOR_DPI_AWARE */
+            if (hr == 0) { logf("DPI: per-monitor (shcore)"); return; }
+            logf("DPI: shcore SetProcessDpiAwareness -> %08X", hr);
+        }
     }
+    logf("DPI: SetProcessDPIAware (system) -> %d", SetProcessDPIAware());
 }
 
 static HWND WINAPI hkCreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR name, DWORD style, int x, int y,
@@ -628,6 +649,30 @@ static DWORD WINAPI clip_thread(LPVOID p)
 }
 
 /* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+/* dinput8.dll proxy: the game imports DirectInput8Create, so Windows   */
+/* loads this DLL from the game folder before any game code runs.       */
+/* The real DirectInput is loaded from the system folder on first use. */
+/* ------------------------------------------------------------------ */
+typedef HRESULT (WINAPI *pDirectInput8Create)(HINSTANCE, DWORD, const void *, void **, void *);
+
+__declspec(dllexport) HRESULT WINAPI DirectInput8Create(HINSTANCE hinst, DWORD ver, const void *riid, void **out, void *outer)
+{
+    static pDirectInput8Create real;
+    if (!real) {
+        WCHAR path[MAX_PATH + 32];
+        UINT n = GetSystemDirectoryW(path, MAX_PATH);   /* SysWOW64 for a 32-bit process */
+        HMODULE m;
+        if (n == 0 || n >= MAX_PATH) return E_FAIL;
+        lstrcatW(path, L"\\dinput8.dll");
+        m = LoadLibraryW(path);
+        if (m) real = (pDirectInput8Create)GetProcAddress(m, "DirectInput8Create");
+        logf("system dinput8: %s", real ? "ok" : "FAILED");
+        if (!real) return E_FAIL;
+    }
+    return real(hinst, ver, riid, out, outer);
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 {
     (void)reserved;
@@ -636,6 +681,12 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         WCHAR p[MAX_PATH];
         int i, n;
         DisableThreadLibraryCalls(inst);
+
+        /* As a dinput8.dll proxy this DLL may also be loaded by other programs in the game
+           folder (swconfig.exe, ...). Only touch swkotor.exe; elsewhere just forward DirectInput. */
+        n = GetModuleFileNameW(NULL, p, MAX_PATH);
+        for (i = n - 1; i >= 0 && p[i] != L'\\' && p[i] != L'/'; i--) {}
+        if (lstrcmpiW(p + i + 1, L"swkotor.exe") != 0) return TRUE;
 
         n = GetModuleFileNameW(inst, g_dir, MAX_PATH);
         for (i = n - 1; i >= 0 && g_dir[i] != L'\\' && g_dir[i] != L'/'; i--) {}

@@ -620,7 +620,7 @@ namespace KotorLauncher
         [STAThread]
         static int Main(string[] args)
         {
-            Native.SetProcessDPIAware();
+            Native.MakeDpiAware();
             L.Init(Settings.Load().Language);
             if (args.Length >= 4 && args[0] == "-genhud")
             {
